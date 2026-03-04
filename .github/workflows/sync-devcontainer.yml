@@ -1,0 +1,152 @@
+name: Sync devcontainer.json across org repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (list repos, do not open PRs)"
+        required: false
+        default: "false"
+  push:
+    paths:
+      - ".devcontainer/devcontainer-template.json"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.DEVCONTAINER_SYNC_TOKEN }}
+      ORG: lisp-stat
+      # Repos to skip (space-separated). The .github repo syncs to others, not itself.
+      SKIP_REPOS: ".github devcontainer-features"
+
+    steps:
+      - name: Checkout .github repo (contains the template)
+        uses: actions/checkout@v4
+
+      - name: Verify token has required scopes
+        run: |
+          echo "Checking token identity..."
+          gh api user --jq '.login'
+
+      - name: Discover all org repos
+        id: list-repos
+        run: |
+          echo "Fetching repo list for org: $ORG"
+          REPOS=$(gh api "orgs/$ORG/repos?type=all&per_page=100" \
+            --paginate \
+            --jq '.[].name' | sort)
+          echo "Found repos:"
+          echo "$REPOS"
+          # Filter out skipped repos
+          FILTERED=""
+          for repo in $REPOS; do
+            skip=false
+            for s in $SKIP_REPOS; do
+              [ "$repo" = "$s" ] && skip=true && break
+            done
+            [ "$skip" = "false" ] && FILTERED="$FILTERED $repo"
+          done
+          echo "repos=$(echo $FILTERED | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync devcontainer.json to each repo
+        run: |
+          TEMPLATE=".devcontainer/devcontainer-template.json"
+          BRANCH="chore/sync-devcontainer"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          for REPO in ${{ steps.list-repos.outputs.repos }}; do
+            echo ""
+            echo "=== Processing $ORG/$REPO ==="
+
+            # Render template: substitute {{REPO_NAME}} with the actual repo name
+            RENDERED=$(sed "s/{{REPO_NAME}}/$REPO/g" "$TEMPLATE")
+
+            # Fetch current devcontainer.json from the default branch (if it exists)
+            CURRENT=$(gh api \
+              "repos/$ORG/$REPO/contents/.devcontainer/devcontainer.json" \
+              --jq '.content' 2>/dev/null \
+              | base64 --decode 2>/dev/null || echo "")
+
+            if [ "$RENDERED" = "$CURRENT" ]; then
+              echo "  Already up-to-date, skipping."
+              continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  [DRY RUN] Would open PR to update .devcontainer/devcontainer.json"
+              continue
+            fi
+
+            # Get the SHA of the default branch HEAD
+            DEFAULT_BRANCH=$(gh api "repos/$ORG/$REPO" --jq '.default_branch')
+            SHA=$(gh api "repos/$ORG/$REPO/git/ref/heads/$DEFAULT_BRANCH" \
+              --jq '.object.sha')
+
+            # Create (or reset) the sync branch
+            # Try to create; if it already exists, update it to HEAD
+            gh api "repos/$ORG/$REPO/git/refs" \
+              --method POST \
+              --field ref="refs/heads/$BRANCH" \
+              --field sha="$SHA" 2>/dev/null \
+            || gh api "repos/$ORG/$REPO/git/refs/heads/$BRANCH" \
+              --method PATCH \
+              --field sha="$SHA" \
+              --field force=true
+
+            # Get existing file SHA if present (required for updates via contents API)
+            FILE_SHA=$(gh api \
+              "repos/$ORG/$REPO/contents/.devcontainer/devcontainer.json" \
+              --jq '.sha' 2>/dev/null || echo "")
+
+            # Encode rendered content as base64
+            ENCODED=$(printf '%s' "$RENDERED" | base64 -w 0)
+
+            # Commit to the branch (create or update)
+            if [ -z "$FILE_SHA" ]; then
+              gh api "repos/$ORG/$REPO/contents/.devcontainer/devcontainer.json" \
+                --method PUT \
+                --field message="chore: add standard Lisp-Stat devcontainer config" \
+                --field content="$ENCODED" \
+                --field branch="$BRANCH"
+            else
+              gh api "repos/$ORG/$REPO/contents/.devcontainer/devcontainer.json" \
+                --method PUT \
+                --field message="chore: sync standard Lisp-Stat devcontainer config" \
+                --field content="$ENCODED" \
+                --field sha="$FILE_SHA" \
+                --field branch="$BRANCH"
+            fi
+
+            # Open a PR (skip if one already exists from this branch)
+            EXISTING_PR=$(gh pr list \
+              --repo "$ORG/$REPO" \
+              --head "$BRANCH" \
+              --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+            if [ -n "$EXISTING_PR" ]; then
+              echo "  PR #$EXISTING_PR already exists, updated branch in-place."
+            else
+              gh pr create \
+                --repo "$ORG/$REPO" \
+                --head "$BRANCH" \
+                --base "$DEFAULT_BRANCH" \
+                --title "chore: sync standard Lisp-Stat devcontainer config" \
+                --body "$(cat <<'EOF'
+## Sync: standard Lisp-Stat devcontainer config
+
+This PR was opened automatically by the [sync-devcontainer workflow](https://github.com/lisp-stat/.github/actions/workflows/sync-devcontainer.yml) in the `lisp-stat/.github` repo.
+
+### What changed
+`.devcontainer/devcontainer.json` has been updated to match the canonical template. The only repo-specific value is the `name` field.
+
+### Why
+All Lisp-Stat repos use the same `ghcr.io/lisp-stat/ls-dev:latest` image. Keeping `devcontainer.json` identical (except the name) ensures contributors and fork users get the same environment everywhere.
+
+### To update the template
+Edit `.devcontainer/devcontainer-template.json` in the [`lisp-stat/.github`](https://github.com/lisp-stat/.github) repo. The sync workflow will open PRs in all other repos automatically.
+EOF
+)"
+              echo "  PR opened."
+            fi
+          done
