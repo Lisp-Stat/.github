@@ -53,7 +53,24 @@ jobs:
         run: |
           TEMPLATE=".devcontainer/devcontainer-template.json"
           BRANCH="chore/sync-devcontainer"
-          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          if [ -z "$DRY_RUN" ]; then DRY_RUN="false"; fi
+
+          # Write PR body to a file to avoid quoting issues
+          cat > /tmp/pr-body.md << 'PREOF'
+          ## Sync: standard Lisp-Stat devcontainer config
+
+          This PR was opened automatically by the sync-devcontainer workflow
+          in the `lisp-stat/.github` repo.
+
+          ### What changed
+          `.devcontainer/devcontainer.json` updated to match the canonical
+          template. The only repo-specific field is `name`.
+
+          ### To update the template
+          Edit `.devcontainer/devcontainer-template.json` in `lisp-stat/.github`.
+          The sync workflow will open PRs in all other repos automatically.
+          PREOF
 
           for REPO in ${{ steps.list-repos.outputs.repos }}; do
             echo ""
@@ -132,21 +149,7 @@ jobs:
                 --head "$BRANCH" \
                 --base "$DEFAULT_BRANCH" \
                 --title "chore: sync standard Lisp-Stat devcontainer config" \
-                --body "$(cat <<'EOF'
-## Sync: standard Lisp-Stat devcontainer config
-
-This PR was opened automatically by the [sync-devcontainer workflow](https://github.com/lisp-stat/.github/actions/workflows/sync-devcontainer.yml) in the `lisp-stat/.github` repo.
-
-### What changed
-`.devcontainer/devcontainer.json` has been updated to match the canonical template. The only repo-specific value is the `name` field.
-
-### Why
-All Lisp-Stat repos use the same `ghcr.io/lisp-stat/ls-dev:latest` image. Keeping `devcontainer.json` identical (except the name) ensures contributors and fork users get the same environment everywhere.
-
-### To update the template
-Edit `.devcontainer/devcontainer-template.json` in the [`lisp-stat/.github`](https://github.com/lisp-stat/.github) repo. The sync workflow will open PRs in all other repos automatically.
-EOF
-)"
+                --body-file /tmp/pr-body.md
               echo "  PR opened."
             fi
           done
